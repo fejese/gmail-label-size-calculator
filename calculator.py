@@ -10,11 +10,11 @@ from typing import Dict, List, Optional, Union
 import click
 from lib.auth import CredentialsProvider
 from lib.logging import format_number, get_logger
+from lib.message_fetcher import BatchedMessageFetcher, MessageFetcher
 from lib.service import ServiceProvider
 
 
 LOGGER = get_logger()
-MESSAGE_FETCHING_CONCURRENCY = 25
 
 
 @dataclass
@@ -30,23 +30,6 @@ class LabelData:
 
     def __str__(self) -> str:
         return f"{self.name} {self.count} {format_number(self.size)}"
-
-
-class MessageFetcher:
-    def __init__(self, service_provider: ServiceProvider) -> None:
-        self._service_provider = service_provider
-        self._messages_svc = None
-
-    def get_message(self, message_id) -> Dict[str, Union[str, int, List[str]]]:
-        return self._messages_svc.get(
-            userId="me", id=message_id, format="minimal"
-        ).execute()
-
-    async def gen_message(self, message_id) -> Dict[str, Union[str, int, List[str]]]:
-        self._messages_svc = await self._service_provider.create_messages_service(self)
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self.get_message, message_id
-        )
 
 
 @dataclass
@@ -83,20 +66,27 @@ class State:
 @dataclass
 class Calculator:
     def __init__(
-        self, service_provider: ServiceProvider, snapshot: Path, state: State
+        self,
+        service_provider: ServiceProvider,
+        message_fetching_concurrency: int,
+        snapshot: Path,
+        state: State,
     ) -> None:
         self.service_provider = service_provider
         self.snapshot = snapshot
         self.state = state
 
-        self.message_fetchers = [
-            MessageFetcher(service_provider)
-            for i in range(MESSAGE_FETCHING_CONCURRENCY)
-        ]
+        self.batched_message_fetcher = BatchedMessageFetcher(
+            service_provider, pool_size=message_fetching_concurrency
+        )
 
     @classmethod
     def load_or_create(
-        cls, service_provider: ServiceProvider, snapshot: Path, message_per_page: int
+        cls,
+        service_provider: ServiceProvider,
+        message_fetching_concurrency: int,
+        snapshot: Path,
+        message_per_page: int,
     ) -> Optional["Calculator"]:
         if snapshot.exists():
             LOGGER.info(f"Loading state from snapshot")
@@ -108,11 +98,15 @@ class Calculator:
                         f"using {state.message_per_page} from snapshot"
                     )
                 return Calculator(
-                    service_provider=service_provider, snapshot=snapshot, state=state
+                    service_provider=service_provider,
+                    message_fetching_concurrency=message_fetching_concurrency,
+                    snapshot=snapshot,
+                    state=state,
                 )
         else:
             return Calculator(
                 service_provider=service_provider,
+                message_fetching_concurrency=message_fetching_concurrency,
                 snapshot=snapshot,
                 state=State(done=False, labels={}, message_per_page=message_per_page),
             )
@@ -134,29 +128,15 @@ class Calculator:
         self.save()
 
     async def gen_stat_for_messages(
-        self, messages: List[Dict[str, Union[str, int]]]
+        self, message_headers: List[Dict[str, Union[str, int]]]
     ) -> None:
-        remaining = messages
-        current_batch = None
+        messages = await self.batched_message_fetcher.fetch_messages(message_headers)
 
-        while remaining:
-            current_batch = remaining[:MESSAGE_FETCHING_CONCURRENCY]
-            remaining = remaining[MESSAGE_FETCHING_CONCURRENCY:]
-
-            message_responses = await asyncio.gather(
-                *[
-                    self.message_fetchers[i].gen_message(current_batch[i]["id"])
-                    for i in range(
-                        min(len(current_batch), MESSAGE_FETCHING_CONCURRENCY)
-                    )
-                ]
-            )
-
-            for message_response in message_responses:
-                size = message_response.get("sizeEstimate", 0)
-                for label_id in message_response.get("labelIds", []):
-                    self.state.labels[label_id].count += 1
-                    self.state.labels[label_id].size += size
+        for message in messages:
+            size = message.get("sizeEstimate", 0)
+            for label_id in message.get("labelIds", []):
+                self.state.labels[label_id].count += 1
+                self.state.labels[label_id].size += size
 
     async def gen_stat(self) -> None:
         message_service = await self.service_provider.create_messages_service()
@@ -225,12 +205,20 @@ async def main(calculator: Calculator) -> None:
     type=int,
     required=True,
     help=(
-        "How many messages to query at once."
+        "How many message headers to query at once."
         "Snapshots will be taken after processing this many messages."
     ),
 )
 @click.option(
     "-c",
+    "--message-fetching-concurrency",
+    type=int,
+    default=25,
+    help="How many messages to fetch in parallel while processing a page of headers.",
+    show_default=True,
+)
+@click.option(
+    "-C",
     "--credentials",
     "credentials_file",
     type=Path,
@@ -239,7 +227,7 @@ async def main(calculator: Calculator) -> None:
     show_default=True,
 )
 @click.option(
-    "-t",
+    "-T",
     "--token",
     "token_file",
     type=Path,
@@ -248,6 +236,7 @@ async def main(calculator: Calculator) -> None:
     show_default=True,
 )
 @click.option(
+    "-S",
     "--scopes",
     type=str,
     multiple=True,
@@ -258,6 +247,7 @@ async def main(calculator: Calculator) -> None:
 def cli(
     snapshot: Path,
     messages_per_page: int,
+    message_fetching_concurrency: int,
     credentials_file: Path,
     token_file: Path,
     scopes: List[str],
@@ -266,7 +256,10 @@ def cli(
         credentials_file=credentials_file, token_file=token_file, scopes=scopes
     )
     calculator = Calculator.load_or_create(
-        ServiceProvider(credentials_provider), snapshot, messages_per_page
+        ServiceProvider(credentials_provider),
+        message_fetching_concurrency,
+        snapshot,
+        messages_per_page,
     )
 
     try:
