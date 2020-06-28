@@ -262,11 +262,14 @@ def cli(
         messages_per_page,
     )
 
+    loop = asyncio.get_event_loop()
     try:
-        asyncio.run(main(calculator))
+        loop.run_until_complete(main(calculator))
     except KeyboardInterrupt:
         LOGGER.info("Processing cancelled, stat loaded so far:")
         calculator.state.print_stat()
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
